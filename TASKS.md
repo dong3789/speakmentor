@@ -148,3 +148,12 @@ time (~2.5-4s); next lever would be streaming the reply (v2).
   예시 하나 더 3개. 실패 시 차감 없음.
 - 앵무새 성장 단계: 레벨에 따라 🐣→🐤→🦜→🌟 (home 성장 카드).
 - 메타: meta_by_user[*].seeds / seeds_updated_at (마이그레이션: 기존 유저 100개 지급).
+
+## Listening podcast generator (2026-09-24)
+
+- /podcast tab: 주제(프리셋+자유입력)·레벨(A1~B2)·길이(3/5/8분) 선택 →
+  Gemini가 짧은 문장 스크립트(en+ko) 작성 → kokoro 줄당 음성 → ffmpeg concat
+  (줄 사이 0.45s 쉼) → data/audio/podcast-{id}.mp3. 백그라운드 생성, 진행률 폴링.
+- 플레이어: 오디오 + 스크립트 동기화(현재 줄 하이라이트·클릭 시그), 한국어 번역
+  토글(끄면 귀트 모드), 배속 0.75/1/1.25. 컨테이너에 ffmpeg 추가.
+- 줄 수 추정: minutes × 15줄 (줄당 ~3.3초). 생성 실패 시 status=error 표시.

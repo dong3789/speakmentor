@@ -77,8 +77,24 @@ export type MetaRow = {
   seeds_updated_at: string | null;
 };
 
+export type PodcastEpisode = {
+  id: string;
+  user_id: string;
+  title: string;
+  topic: string;
+  level: string;
+  status: "generating" | "ready" | "error";
+  progress: number; // 0..1
+  error?: string;
+  lines: { en: string; ko: string; offset: number; dur: number }[];
+  audio: string | null;
+  duration: number;
+  created_at: string;
+};
+
 type DB = {
   users: UserRow[];
+  podcasts: PodcastEpisode[];
   auth_sessions: AuthSessionRow[];
   invite_codes: InviteCodeRow[];
   sessions: SessionRow[];
@@ -115,6 +131,7 @@ async function load(): Promise<DB> {
     parsed.users = parsed.users ?? [];
     parsed.auth_sessions = parsed.auth_sessions ?? [];
     parsed.invite_codes = parsed.invite_codes ?? [];
+    parsed.podcasts = parsed.podcasts ?? [];
     parsed.phrases = parsed.phrases ?? [];
     parsed.activity = parsed.activity ?? [];
     parsed.sessions = parsed.sessions ?? [];
@@ -163,8 +180,8 @@ async function load(): Promise<DB> {
     cache = parsed as DB;
   } catch {
     cache = {
-      users: [], auth_sessions: [], invite_codes: [], sessions: [], turns: [], errors: [],
-      phrases: [], activity: [], meta_by_user: {},
+      users: [], auth_sessions: [], invite_codes: [], podcasts: [], sessions: [], turns: [],
+      errors: [], phrases: [], activity: [], meta_by_user: {},
     };
   }
   return cache;
@@ -678,7 +695,7 @@ export async function cleanupOldAudio(): Promise<number> {
   try {
     const files = await readdir(dir);
     for (const f of files) {
-      if (f.startsWith("opening-")) continue; // cached intro audio: keep
+      if (f.startsWith("opening-") || f.startsWith("podcast-")) continue; // cached intros + podcast episodes: keep
       const full = path.join(dir, f);
       const st = await stat(full).catch(() => null);
       if (st && st.mtimeMs < cutoff) {
@@ -705,4 +722,59 @@ export async function cleanupOldAudio(): Promise<number> {
     await save();
   }
   return removed;
+}
+
+// ---- podcast episodes ----
+
+export async function createPodcastEpisode(userId: string, topic: string, level: string): Promise<PodcastEpisode> {
+  const db = await load();
+  const ep: PodcastEpisode = {
+    id: randomUUID(),
+    user_id: userId,
+    title: "생성 중...",
+    topic,
+    level,
+    status: "generating",
+    progress: 0,
+    lines: [],
+    audio: null,
+    duration: 0,
+    created_at: new Date().toISOString(),
+  };
+  db.podcasts.push(ep);
+  await save();
+  return ep;
+}
+
+export async function getPodcastEpisode(id: string, userId?: string): Promise<PodcastEpisode | null> {
+  const db = await load();
+  const ep = db.podcasts.find((p) => p.id === id);
+  if (!ep) return null;
+  if (userId && ep.user_id !== userId) return null;
+  return ep;
+}
+
+export async function updatePodcastEpisode(id: string, patch: Partial<PodcastEpisode>): Promise<void> {
+  const db = await load();
+  const ep = db.podcasts.find((p) => p.id === id);
+  if (!ep) return;
+  Object.assign(ep, patch);
+  await save();
+}
+
+export async function listPodcastEpisodes(userId?: string): Promise<PodcastEpisode[]> {
+  const db = await load();
+  return db.podcasts
+    .filter((p) => !userId || p.user_id === userId)
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+export async function deletePodcastEpisode(id: string, userId?: string): Promise<boolean> {
+  const db = await load();
+  const ep = db.podcasts.find((p) => p.id === id);
+  if (!ep) return false;
+  if (userId && ep.user_id !== userId) return false;
+  db.podcasts = db.podcasts.filter((p) => p.id !== id);
+  await save();
+  return true;
 }

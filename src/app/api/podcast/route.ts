@@ -28,7 +28,7 @@ export async function POST(req: Request) {
   const body = await req.json().catch(() => ({}));
   const topic = String(body.topic || "everyday life").slice(0, 60);
   const level = ["A1", "A2", "B1", "B2"].includes(body.level) ? body.level : "A2";
-  const minutes = Math.max(2, Math.min(10, Number(body.minutes) || 4));
+  const minutes = Math.max(2, Math.min(30, Number(body.minutes) || 5));
 
   const mine = await listPodcastEpisodes(user.id);
   if (mine.some((e) => e.status === "generating")) {

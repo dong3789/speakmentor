@@ -19,9 +19,10 @@ type Line = { en: string; ko: string; offset: number; dur: number };
 const LEVELS = ["A1", "A2", "B1", "B2"];
 const TOPICS = ["daily life", "food", "work", "travel", "weather", "hobbies"];
 const LENGTHS = [
-  { minutes: 3, label: "3분 (약 18문장)" },
-  { minutes: 5, label: "5분 (약 30문장)" },
-  { minutes: 8, label: "8분 (약 48문장)" },
+  { minutes: 3, label: "3분" },
+  { minutes: 8, label: "8분" },
+  { minutes: 15, label: "15분" },
+  { minutes: 30, label: "30분" },
 ];
 
 function fmt(sec: number): string {
@@ -189,7 +190,7 @@ export default function PodcastPage() {
               {busy ? "생성 중..." : "에피소드 만들기"}
             </button>
             <p className="faint" style={{ marginTop: 8 }}>
-              스크립트 작성 → 문장별 음성 생성 → 하나의 mp3로 합칩니다. 1~2분 걸려요.
+              스크립트 작성 → 문장별 음성 생성 → 하나의 mp3 합본. 길이에 따라 생성에 몇 분 걸릴 수 있어요.
             </p>
             {error && <p style={{ color: "var(--red)", fontSize: 13 }}>{error}</p>}
           </section>

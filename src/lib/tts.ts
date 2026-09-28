@@ -24,6 +24,7 @@ export async function synthesizeSpeech(text: string): Promise<string> {
       voice: process.env.TTS_VOICE || "nova",
       input: text,
     }),
+    signal: AbortSignal.timeout(30000), // 한 줄이 멈춰도 에피소드 전체가 멈추지 않게
   });
   if (!res.ok) {
     throw new Error(`TTS failed: ${res.status} ${(await res.text()).slice(0, 200)}`);

@@ -118,7 +118,7 @@ function songLength(clips: AudioBuffer[], bpm: number): number {
 }
 
 // Places voice clips and the backing beat; works for live AND offline render.
-function scheduleSong(ctx: BaseAudioContext, clips: AudioBuffer[], bpm: number, style: StyleKey, startAt: number): { endTime: number; slots: number[][] } {
+function scheduleSong(ctx: BaseAudioContext, clips: AudioBuffer[], bpm: number, style: StyleKey, startAt: number, tone = 1): { endTime: number; slots: number[][] } {
   const beat = 60 / bpm;
   const bar = beat * 4;
   let t = startAt;
@@ -130,6 +130,7 @@ function scheduleSong(ctx: BaseAudioContext, clips: AudioBuffer[], bpm: number, 
     slots.push([t, t + bars * bar]);
     const src = ctx.createBufferSource();
     src.buffer = clip;
+    src.playbackRate.value = tone;
     const g = ctx.createGain(); g.gain.value = 1.0;
     const lp = ctx.createBiquadFilter();
     lp.type = "lowpass";
@@ -167,7 +168,15 @@ function toWav(buffer: AudioBuffer): Blob {
 
 // ---- component ----
 
-export default function RemixCard() {
+export default function RemixCard({
+  endpoint = "/api/remix",
+  title = "리듬 복습 — 내 목소리 리믹스",
+  hint = "저장된 내 녹음으로 비트에 맞춘 노래를 만들어 듣고, WAV로 저장할 수 있어요.",
+}: {
+  endpoint?: string;
+  title?: string;
+  hint?: string;
+}) {
   const [open, setOpen] = useState(false);
   const [lines, setLines] = useState<Line[] | null>(null);
   const [style, setStyle] = useState<StyleKey>("lofi");
@@ -175,13 +184,14 @@ export default function RemixCard() {
   const [nowLine, setNowLine] = useState(-1);
   const [wav, setWav] = useState<string | null>(null);
   const [rendering, setRendering] = useState(false);
+  const [tone, setTone] = useState(1);
   const ctxRef = useRef<AudioContext | null>(null);
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const slotsRef = useRef<number[][]>([]);
 
   useEffect(() => {
     if (!open || lines) return;
-    fetch("/api/remix")
+    fetch(endpoint)
       .then((r) => r.json())
       .then((d) => setLines(d.lines || []))
       .catch(() => setStatus("error"));
@@ -217,7 +227,7 @@ export default function RemixCard() {
     loadClips(lines, ctx)
       .then((clips) => {
         const startAt = ctx.currentTime + 0.15;
-        const { endTime, slots } = scheduleSong(ctx, clips, STYLES[style].bpm, style, startAt);
+        const { endTime, slots } = scheduleSong(ctx, clips, STYLES[style].bpm, style, startAt, tone);
         slotsRef.current = slots;
         timerRef.current = setInterval(() => {
           const now = ctx.currentTime;
@@ -246,7 +256,7 @@ export default function RemixCard() {
       const bpm = STYLES[style].bpm;
       const len = songLength(clips, bpm);
       const off = new OfflineAudioContext(2, Math.ceil(len * 44100), 44100);
-      scheduleSong(off, clips, bpm, style, 0);
+      scheduleSong(off, clips, bpm, style, 0, tone);
       const rendered = await off.startRendering();
       const blob = toWav(rendered);
       const url = URL.createObjectURL(blob);
@@ -263,7 +273,7 @@ export default function RemixCard() {
   return (
     <section className="card" style={{ borderColor: "var(--purple)" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <b style={{ fontSize: 15 }}>🎵 리듬 복습 — 내 목소리 리믹스</b>
+        <b style={{ fontSize: 15 }}>🎵 {title}</b>
         <button className="btn secondary small" onClick={() => setOpen(!open)}>
           {open ? "접기" : "열기"}
         </button>
@@ -275,6 +285,11 @@ export default function RemixCard() {
           <p className="faint" style={{ margin: "8px 0" }}>
             내가 말한 문장들이 비트에 올라갑니다. 들으면서 따라 불러보세요 🎤
           </p>
+          <div className="segmented" style={{ marginBottom: 10 }}>
+            {[["1", "자연"], ["1.15", "밝게"], ["0.9", "느긋"]].map(([v, l]) => (
+              <button key={v} className={tone === Number(v) ? "on" : ""} onClick={() => setTone(Number(v))}>{l}</button>
+            ))}
+          </div>
           <div className="segmented" style={{ marginBottom: 10 }}>
             {(Object.keys(STYLES) as StyleKey[]).map((k) => (
               <button key={k} className={style === k ? "on" : ""} onClick={() => { if (status !== "playing") setStyle(k); }}>

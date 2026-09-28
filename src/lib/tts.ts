@@ -36,6 +36,22 @@ export async function synthesizeSpeech(text: string): Promise<string> {
   return `/api/audio/${name}`;
 }
 
+// Diary recordings use a dedicated prefix so retention cleanup keeps them
+// (diary entries are meant to be replayed long-term).
+export async function saveDiaryAudio(audio: Blob): Promise<string> {
+  await mkdir(AUDIO_DIR, { recursive: true });
+  const ext = audio.type.includes("mp4") || audio.type.includes("aac")
+    ? ".m4a"
+    : audio.type.includes("wav")
+      ? ".wav"
+      : audio.type.includes("mpeg")
+        ? ".mp3"
+        : ".webm";
+  const name = `diary-${randomUUID()}${ext}`;
+  await writeFile(path.join(AUDIO_DIR, name), Buffer.from(await audio.arrayBuffer()));
+  return `/api/audio/${name}`;
+}
+
 export async function saveUserAudio(audio: Blob): Promise<string> {
   await mkdir(AUDIO_DIR, { recursive: true });
   const ext = audio.type.includes("mp4") || audio.type.includes("aac")

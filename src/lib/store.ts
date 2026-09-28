@@ -77,6 +77,17 @@ export type MetaRow = {
   seeds_updated_at: string | null;
 };
 
+export type DiaryEntry = {
+  id: string;
+  user_id: string;
+  date: string; // KST YYYY-MM-DD
+  text: string;
+  corrected: string | null;
+  ko: string | null;
+  audio_path: string | null;
+  created_at: string;
+};
+
 export type PodcastEpisode = {
   id: string;
   user_id: string;
@@ -95,6 +106,7 @@ export type PodcastEpisode = {
 type DB = {
   users: UserRow[];
   podcasts: PodcastEpisode[];
+  diary: DiaryEntry[];
   auth_sessions: AuthSessionRow[];
   invite_codes: InviteCodeRow[];
   sessions: SessionRow[];
@@ -132,6 +144,7 @@ async function load(): Promise<DB> {
     parsed.auth_sessions = parsed.auth_sessions ?? [];
     parsed.invite_codes = parsed.invite_codes ?? [];
     parsed.podcasts = parsed.podcasts ?? [];
+    parsed.diary = parsed.diary ?? [];
     parsed.phrases = parsed.phrases ?? [];
     parsed.activity = parsed.activity ?? [];
     parsed.sessions = parsed.sessions ?? [];
@@ -180,8 +193,8 @@ async function load(): Promise<DB> {
     cache = parsed as DB;
   } catch {
     cache = {
-      users: [], auth_sessions: [], invite_codes: [], podcasts: [], sessions: [], turns: [],
-      errors: [], phrases: [], activity: [], meta_by_user: {},
+      users: [], auth_sessions: [], invite_codes: [], podcasts: [], diary: [], sessions: [],
+      turns: [], errors: [], phrases: [], activity: [], meta_by_user: {},
     };
   }
   return cache;
@@ -695,7 +708,7 @@ export async function cleanupOldAudio(): Promise<number> {
   try {
     const files = await readdir(dir);
     for (const f of files) {
-      if (f.startsWith("opening-") || f.startsWith("podcast-")) continue; // cached intros + podcast episodes: keep
+      if (f.startsWith("opening-") || f.startsWith("podcast-") || f.startsWith("diary-")) continue; // cached intros + podcast episodes: keep
       const full = path.join(dir, f);
       const st = await stat(full).catch(() => null);
       if (st && st.mtimeMs < cutoff) {
@@ -722,6 +735,58 @@ export async function cleanupOldAudio(): Promise<number> {
     await save();
   }
   return removed;
+}
+
+// ---- diary entries ----
+
+// KST calendar date (shared helper style with seeds)
+function diaryDate(): string {
+  return new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Seoul" });
+}
+
+export async function addDiaryEntry(
+  userId: string,
+  entry: { text: string; corrected: string | null; ko: string | null; audio_path: string | null },
+): Promise<DiaryEntry> {
+  const db = await load();
+  const row: DiaryEntry = {
+    id: randomUUID(),
+    user_id: userId,
+    date: diaryDate(),
+    text: entry.text,
+    corrected: entry.corrected,
+    ko: entry.ko,
+    audio_path: entry.audio_path,
+    created_at: new Date().toISOString(),
+  };
+  db.diary.push(row);
+  await save();
+  return row;
+}
+
+export async function listDiaryEntries(userId?: string): Promise<DiaryEntry[]> {
+  const db = await load();
+  return db.diary
+    .filter((d) => !userId || d.user_id === userId)
+    .sort((a, b) => b.created_at.localeCompare(a.created_at));
+}
+
+export async function getDiaryEntry(id: string, userId?: string): Promise<DiaryEntry | null> {
+  const db = await load();
+  const row = db.diary.find((d) => d.id === id);
+  if (!row) return null;
+  if (userId && row.user_id !== userId) return null;
+  return row;
+}
+
+export async function deleteDiaryEntry(id: string, userId?: string): Promise<DiaryEntry | null> {
+  const db = await load();
+  const row = db.diary.find((d) => d.id === id);
+  if (!row) return null;
+  if (userId && row.user_id !== userId) return null;
+  db.diary = db.diary.filter((d) => d.id !== id);
+  await save();
+  return row;
 }
 
 // ---- podcast episodes ----

@@ -14,7 +14,7 @@ export type UserRow = {
   username: string;
   password_hash: string;
   salt: string;
-  role: "admin" | "user";
+  role: "admin" | "user" | "demo";
   created_at: string;
 };
 
@@ -212,9 +212,10 @@ function useSupabase() {
 
 // ---- auth ----
 
-export async function createUser(username: string, password: string, role: "admin" | "user" = "user"): Promise<UserRow | null> {
+export async function createUser(username: string, password: string, role: "admin" | "user" | "demo" = "user"): Promise<UserRow | null> {
   const db = await load();
   const uname = username.toLowerCase();
+  if (uname.startsWith("demo_")) return null;
   if (db.users.some((u) => u.username === uname)) return null;
   const { hash, salt } = hashPassword(password);
   const user: UserRow = { id: randomUUID(), username: uname, password_hash: hash, salt, role, created_at: new Date().toISOString() };
@@ -228,8 +229,81 @@ export async function createUser(username: string, password: string, role: "admi
 export async function authenticate(username: string, password: string): Promise<UserRow | null> {
   const db = await load();
   const user = db.users.find((u) => u.username === username.toLowerCase());
-  if (!user || !verifyPassword(password, user)) return null;
+  if (!user || user.role === "demo" || !verifyPassword(password, user)) return null;
   return user;
+}
+
+export function isDemoUser(user: { role?: string; username?: string } | null | undefined): boolean {
+  if (!user) return false;
+  return user.role === "demo" || Boolean(user.username?.startsWith("demo_"));
+}
+
+export async function createDemoUser(): Promise<UserRow> {
+  const db = await load();
+  let username = `demo_${randomBytes(4).toString("hex")}`;
+  while (db.users.some((u) => u.username === username)) {
+    username = `demo_${randomBytes(4).toString("hex")}`;
+  }
+  const { hash, salt } = hashPassword(randomBytes(24).toString("hex"));
+  const user: UserRow = {
+    id: randomUUID(),
+    username,
+    password_hash: hash,
+    salt,
+    role: "demo",
+    created_at: new Date().toISOString(),
+  };
+  db.users.push(user);
+  db.meta_by_user[user.id] = { ...DEFAULT_META, seeds: 20, seeds_updated_at: new Date().toISOString() };
+  await save();
+  return user;
+}
+
+export async function deleteDemoUserAndData(userId: string): Promise<boolean> {
+  const db = await load();
+  const user = db.users.find((u) => u.id === userId);
+  if (!user || user.role !== "demo") return false;
+  const turnIds = new Set(db.turns.filter((t) => t.user_id === userId).map((t) => t.id));
+  const audio = new Set<string>();
+  for (const row of db.turns) {
+    if (row.user_id !== userId) continue;
+    if (row.audio_path) audio.add(row.audio_path);
+    if (row.reply_audio_path) audio.add(row.reply_audio_path);
+  }
+  for (const row of db.diary) {
+    if (row.user_id === userId && row.audio_path) audio.add(row.audio_path);
+  }
+  for (const row of db.podcasts) {
+    if (row.user_id === userId && row.audio) audio.add(row.audio);
+  }
+  db.users = db.users.filter((u) => u.id !== userId);
+  db.auth_sessions = db.auth_sessions.filter((s) => s.user_id !== userId);
+  db.sessions = db.sessions.filter((s) => s.user_id !== userId);
+  db.turns = db.turns.filter((row) => row.user_id !== userId);
+  db.errors = db.errors.filter((e) => !turnIds.has(e.turn_id));
+  db.phrases = db.phrases.filter((row) => row.user_id !== userId);
+  db.activity = db.activity.filter((row) => row.user_id !== userId);
+  db.diary = db.diary.filter((row) => row.user_id !== userId);
+  db.podcasts = db.podcasts.filter((row) => row.user_id !== userId);
+  delete db.meta_by_user[userId];
+  await save();
+  for (const rel of audio) {
+    const name = path.basename(String(rel));
+    if (!name || name.startsWith("opening-")) continue;
+    try { await unlink(path.join(DATA_DIR, "audio", name)); } catch { /* ignore missing */ }
+  }
+  return true;
+}
+
+export async function pruneDemoUsers(maxAgeMs = 48 * 60 * 60 * 1000): Promise<number> {
+  const db = await load();
+  const cutoff = Date.now() - maxAgeMs;
+  const stale = db.users.filter((u) => u.role === "demo" && new Date(u.created_at).getTime() < cutoff);
+  let n = 0;
+  for (const u of stale) {
+    if (await deleteDemoUserAndData(u.id)) n += 1;
+  }
+  return n;
 }
 
 export async function getUserById(id: string): Promise<UserRow | null> {
@@ -239,7 +313,9 @@ export async function getUserById(id: string): Promise<UserRow | null> {
 
 export async function listUsers(): Promise<UserRow[]> {
   const db = await load();
-  return [...db.users].sort((a, b) => a.created_at.localeCompare(b.created_at));
+  return [...db.users]
+    .filter((u) => u.role !== "demo")
+    .sort((a, b) => a.created_at.localeCompare(b.created_at));
 }
 
 export async function resetUserPassword(userId: string, newPassword: string): Promise<boolean> {
@@ -257,7 +333,19 @@ export async function createAuthSession(userId: string): Promise<string> {
   const db = await load();
   const token = randomBytes(32).toString("hex");
   db.auth_sessions.push({ token, user_id: userId, created_at: new Date().toISOString() });
-  if (db.auth_sessions.length > 500) db.auth_sessions = db.auth_sessions.slice(-300);
+  // Drop stale demo sessions first; never evict a real user's session to make room.
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  const demoIds = new Set(db.users.filter((u) => u.role === "demo").map((u) => u.id));
+  db.auth_sessions = db.auth_sessions.filter((s) => {
+    if (!demoIds.has(s.user_id)) return true;
+    return new Date(s.created_at).getTime() >= cutoff;
+  });
+  if (db.auth_sessions.length > 500) {
+    const real = db.auth_sessions.filter((s) => !demoIds.has(s.user_id));
+    const demo = db.auth_sessions.filter((s) => demoIds.has(s.user_id));
+    const keepDemo = Math.max(0, 500 - real.length);
+    db.auth_sessions = [...real, ...demo.slice(-keepDemo)];
+  }
   await save();
   return token;
 }

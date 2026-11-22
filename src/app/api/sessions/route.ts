@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getUserFromRequest, unauthorized } from "@/lib/auth";
 import { startSession } from "@/lib/pipeline";
 import { finishSession, listSessions, recordActivity } from "@/lib/store";
+import { assertDemoQuota, clientIp, demoError, isDemoUser } from "@/lib/demo";
 
 export const runtime = "nodejs";
 
@@ -16,6 +17,10 @@ export async function POST(req: Request) {
       await finishSession(String(body.session_id));
       recordActivity("session_bonus", user.id).catch(() => {});
       return NextResponse.json({ ok: true });
+    }
+    if (isDemoUser(user)) {
+      const quota = await assertDemoQuota(user, clientIp(req), "check");
+      if (!quota.ok) return demoError(quota.error, quota.status);
     }
     const topic = String(body.topic || "free talk");
     const level = String(body.level || "A2");

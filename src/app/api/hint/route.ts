@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getUserFromRequest, unauthorized } from "@/lib/auth";
+import { demoFeatureBlocked, isDemoUser } from "@/lib/demo";
 import { getGamification, spendSeeds } from "@/lib/store";
 import { aiConfig, hasAIKey } from "@/lib/ai";
 
@@ -13,6 +14,7 @@ const COSTS = { korean: 5, example: 3 } as const;
 export async function POST(req: Request) {
   const user = await getUserFromRequest(req);
   if (!user) return unauthorized();
+  if (isDemoUser(user)) return demoFeatureBlocked();
   const body = await req.json().catch(() => ({}));
   const kind = body.kind === "example" ? "example" : "korean";
   const question = String(body.question || "").slice(0, 300);

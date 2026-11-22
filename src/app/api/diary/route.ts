@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getUserFromRequest, unauthorized } from "@/lib/auth";
+import { demoFeatureBlocked, isDemoUser } from "@/lib/demo";
 import { addDiaryEntry, listDiaryEntries } from "@/lib/store";
 import { hasAIKey, aiConfig } from "@/lib/ai";
 import { transcribeAudio } from "@/lib/stt";
@@ -22,6 +23,7 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   const user = await getUserFromRequest(req);
   if (!user) return unauthorized();
+  if (isDemoUser(user)) return demoFeatureBlocked();
   const form = await req.formData();
   const audio = form.get("audio");
   const audioBlob = audio && typeof audio === "object" && "arrayBuffer" in audio && (audio as Blob).size > 0 ? (audio as Blob) : null;

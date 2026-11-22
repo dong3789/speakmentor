@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getUserFromRequest, unauthorized } from "@/lib/auth";
 import { createPodcastEpisode, getPodcastEpisode, listPodcastEpisodes } from "@/lib/store";
 import { generateEpisode } from "@/lib/podcast";
+import { demoFeatureBlocked, isDemoUser } from "@/lib/demo";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -25,6 +26,7 @@ export async function GET(req: Request) {
 export async function POST(req: Request) {
   const user = await getUserFromRequest(req);
   if (!user) return unauthorized();
+  if (isDemoUser(user)) return demoFeatureBlocked();
   const body = await req.json().catch(() => ({}));
   const topic = String(body.topic || "everyday life").slice(0, 60);
   const level = ["A1", "A2", "B1", "B2"].includes(body.level) ? body.level : "A2";

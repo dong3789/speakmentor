@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getUserFromRequest, unauthorized } from "@/lib/auth";
+import { demoFeatureBlocked, isDemoUser } from "@/lib/demo";
 import { listDiaryEntries } from "@/lib/store";
 
 export const runtime = "nodejs";
@@ -8,6 +9,7 @@ export const runtime = "nodejs";
 export async function GET(req: Request) {
   const user = await getUserFromRequest(req);
   if (!user) return unauthorized();
+  if (isDemoUser(user)) return demoFeatureBlocked();
   const entries = await listDiaryEntries(user.id);
   const lines = entries
     .filter((e) => e.audio_path)

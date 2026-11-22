@@ -37,14 +37,41 @@ type Game = {
   parrot: { emoji: string; name: string; next: { minLevel: number; emoji: string; name: string } | null };
 };
 
-// One shared player so overlapping taps never stack sounds on top of each other.
-let currentAudio: HTMLAudioElement | null = null;
+// One shared <audio> element, reused for every clip. iOS Safari only lets a
+// page play audio after a user gesture; unlocking this single element on the
+// first tap keeps later (non-gesture) plays in hands-free mode working.
+let sharedAudio: HTMLAudioElement | null = null;
+let onAudioEnd: (() => void) | null = null;
+const SILENT_WAV = "data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=";
+
+function getAudio(): HTMLAudioElement {
+  if (!sharedAudio) {
+    sharedAudio = new Audio();
+    sharedAudio.setAttribute("playsinline", "true");
+    sharedAudio.onended = () => fireEnd();
+    sharedAudio.onerror = () => fireEnd();
+  }
+  return sharedAudio;
+}
+
+function fireEnd() {
+  const cb = onAudioEnd;
+  onAudioEnd = null;
+  cb?.();
+}
+
+// Call inside a tap handler.
+function unlockAudio() {
+  const a = getAudio();
+  if (a.dataset.unlocked) return;
+  a.dataset.unlocked = "1";
+  a.src = SILENT_WAV;
+  a.play().catch(() => {});
+}
 
 function stopAudio() {
-  if (currentAudio) {
-    currentAudio.pause();
-    currentAudio = null;
-  }
+  onAudioEnd = null;
+  if (sharedAudio) sharedAudio.pause();
   if (typeof window !== "undefined" && "speechSynthesis" in window) {
     window.speechSynthesis.cancel();
   }
@@ -52,31 +79,48 @@ function stopAudio() {
 
 function playUrl(url: string) {
   stopAudio();
-  const a = new Audio(url);
-  currentAudio = a;
+  const a = getAudio();
+  a.src = url;
   a.play().catch(() => {});
 }
 
-function speak(url: string, text: string) {
+// onEnd fires once when playback finishes (or fails) — drives hands-free mode.
+function speak(url: string, text: string, onEnd?: () => void) {
+  stopAudio();
   if (url) {
-    stopAudio();
-    const a = new Audio(url);
-    currentAudio = a;
-    a.play().catch(() => fallbackSpeak(text));
+    const a = getAudio();
+    onAudioEnd = onEnd ?? null;
+    a.src = url;
+    a.play().catch(() => fallbackSpeak(text, onEnd));
   } else {
-    fallbackSpeak(text);
+    fallbackSpeak(text, onEnd);
   }
 }
 
-function fallbackSpeak(text: string) {
+function fallbackSpeak(text: string, onEnd?: () => void) {
+  onAudioEnd = null;
   if (typeof window !== "undefined" && "speechSynthesis" in window) {
-    stopAudio();
+    window.speechSynthesis.cancel();
     const u = new SpeechSynthesisUtterance(text);
     u.lang = "en-US";
     u.rate = 0.95;
+    if (onEnd) {
+      let done = false;
+      const once = () => { if (!done) { done = true; onEnd(); } };
+      u.onend = once;
+      u.onerror = once;
+    }
     window.speechSynthesis.speak(u);
+  } else {
+    onEnd?.();
   }
 }
+
+// Hangul anywhere in the text = the learner asked in Korean.
+const HANGUL = /[\u3131-\u318E\uAC00-\uD7A3]/;
+const SILENCE_MS = 1500; // auto-stop after this much quiet following speech
+const NO_SPEECH_MS = 15000; // hands-free gives up if nobody talks
+const MAX_REC_MS = 45000;
 
 export default function HomePage() {
   const [phase, setPhase] = useState<"setup" | "live" | "done">("setup");
@@ -100,7 +144,13 @@ export default function HomePage() {
   const [dueCount, setDueCount] = useState(0);
   const [xpFloat, setXpFloat] = useState<{ id: number; text: string } | null>(null);
   const [showSamples, setShowSamples] = useState(false);
-  const [me, setMe] = useState<{ username: string; role: string } | null>(null);
+  type Me = {
+    username: string;
+    role: string;
+    is_demo?: boolean;
+    demo?: { turns_left: number; seconds_left: number; turns_limit: number; minutes_limit: number };
+  };
+  const [me, setMe] = useState<Me | null>(null);
   const [authChecked, setAuthChecked] = useState(false);
   const [authMode, setAuthMode] = useState<"login" | "signup">("login");
   const [authForm, setAuthForm] = useState({ username: "", password: "", invite: "" });
@@ -110,11 +160,19 @@ export default function HomePage() {
   const [koreanHint, setKoreanHint] = useState<string | null>(null);
   const [extraSample, setExtraSample] = useState<string | null>(null);
   const [hintBusy, setHintBusy] = useState<string | null>(null);
+  const [handsFree, setHandsFree] = useState(false);
+  const [askKorean, setAskKorean] = useState(false); // next recording is a Korean question
+  const [help, setHelp] = useState<{ ko: string; en: string; note: string; audio: string } | null>(null);
+  const [speaking, setSpeaking] = useState(false);
+  const handsFreeRef = useRef(false);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const vadRef = useRef<{ raf: number; timer: number } | null>(null);
+  const sendTurnRef = useRef<(blob: Blob | null, text: string, koreanHelp?: boolean) => Promise<void>>(async () => {});
   const mediaRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const recRef = useRef<any>(null);
 
-  useEffect(() => () => { window.speechSynthesis?.cancel(); stopAudio(); }, []);
+  useEffect(() => () => { window.speechSynthesis?.cancel(); stopAudio(); handsFreeRef.current = false; }, []);
 
   useEffect(() => {
     const saved = localStorage.getItem("sm_stt_mode");
@@ -150,7 +208,9 @@ export default function HomePage() {
           const d = await r.json();
           setMe(d);
           loadGame();
-          fetch("/api/invites").then((r2) => r2.json()).then((d2) => setMyCodes(d2.codes || [])).catch(() => {});
+          if (!d.is_demo) {
+            fetch("/api/invites").then((r2) => r2.json()).then((d2) => setMyCodes(d2.codes || [])).catch(() => {});
+          }
         }
       })
       .catch(() => {})
@@ -169,9 +229,23 @@ export default function HomePage() {
       setAuthError(d.error || "실패했습니다");
       return;
     }
-    setMe({ username: d.username, role: d.role });
+    setMe({ username: d.username, role: d.role, is_demo: Boolean(d.is_demo), demo: d.demo });
     loadGame();
-    fetch("/api/invites").then((r) => r.json()).then((d2) => setMyCodes(d2.codes || [])).catch(() => {});
+    if (!d.is_demo) {
+      fetch("/api/invites").then((r) => r.json()).then((d2) => setMyCodes(d2.codes || [])).catch(() => {});
+    }
+  }
+
+  async function startDemo() {
+    setAuthError("");
+    const res = await fetch("/api/auth/demo", { method: "POST" });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setAuthError(d.error || "데모를 시작하지 못했습니다");
+      return;
+    }
+    setMe({ username: d.username, role: d.role, is_demo: true, demo: d.demo });
+    loadGame();
   }
 
   function shareLink(code: string): string {
@@ -218,6 +292,7 @@ export default function HomePage() {
   }
 
   async function startSession() {
+    unlockAudio();
     setProcessing(true);
     try {
       const res = await fetch("/api/sessions", {
@@ -226,11 +301,16 @@ export default function HomePage() {
         body: JSON.stringify({ topic, level }),
       });
       const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || "세션을 시작하지 못했습니다.");
+        return;
+      }
       setSessionId(data.session_id);
       setPrompt(data.opening_en);
       setTarget(data.opening_target || "");
       setTurns([]);
       setPhase("live");
+      setHelp(null);
       speak(data.opening_audio_url || "", data.opening_en);
     } finally {
       setProcessing(false);
@@ -271,7 +351,7 @@ export default function HomePage() {
         setListening(false);
         const text = finalText.trim();
         setLiveText("");
-        if (text) sendTurn(null, text);
+        if (text) sendTurn(null, text, HANGUL.test(text));
       };
       rec.onerror = (e: any) => {
         setListening(false);
@@ -304,25 +384,85 @@ export default function HomePage() {
     return "";
   }
 
-  async function startRecording() {
+  // autoStop: watch mic level with a Web Audio analyser and stop after
+  // SILENCE_MS of quiet once speech was heard (hands-free mode).
+  async function startRecording(opts: { autoStop?: boolean; korean?: boolean } = {}) {
+    const korean = Boolean(opts.korean);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       setMicOk(true);
       const mime = pickMime();
       const recorder = mime ? new MediaRecorder(stream, { mimeType: mime }) : new MediaRecorder(stream);
       chunksRef.current = [];
+      let heard = false;
+      let cancelled = false;
       recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
       recorder.onstop = async () => {
+        clearVad();
         stream.getTracks().forEach((t) => t.stop());
+        setRecording(false);
+        if (cancelled || (opts.autoStop && !heard)) {
+          // nobody spoke: pause hands-free instead of sending silence
+          if (opts.autoStop && !heard) stopHandsFree();
+          return;
+        }
         const blob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
-        await sendTurn(blob, "");
+        await sendTurnRef.current(blob, "", korean);
       };
       mediaRef.current = recorder;
+      (recorder as any)._cancel = () => { cancelled = true; };
       recorder.start();
       setRecording(true);
+
+      if (opts.autoStop) {
+        const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
+        if (!Ctx) return;
+        if (!audioCtxRef.current) audioCtxRef.current = new Ctx();
+        const ctx = audioCtxRef.current!;
+        if (ctx.state === "suspended") await ctx.resume().catch(() => {});
+        const src = ctx.createMediaStreamSource(stream);
+        const analyser = ctx.createAnalyser();
+        analyser.fftSize = 1024;
+        src.connect(analyser);
+        const buf = new Uint8Array(analyser.fftSize);
+        const started = Date.now();
+        let lastLoud = Date.now();
+        const tick = () => {
+          if (recorder.state !== "recording") return;
+          analyser.getByteTimeDomainData(buf);
+          let sum = 0;
+          for (let i = 0; i < buf.length; i++) {
+            const v = (buf[i] - 128) / 128;
+            sum += v * v;
+          }
+          const rms = Math.sqrt(sum / buf.length);
+          const now = Date.now();
+          if (rms > 0.02) {
+            heard = true;
+            lastLoud = now;
+          }
+          if (
+            (heard && now - lastLoud > SILENCE_MS) ||
+            (!heard && now - started > NO_SPEECH_MS) ||
+            now - started > MAX_REC_MS
+          ) {
+            src.disconnect();
+            recorder.stop();
+            return;
+          }
+          if (vadRef.current) vadRef.current.raf = requestAnimationFrame(tick);
+        };
+        vadRef.current = { raf: requestAnimationFrame(tick), timer: 0 };
+      }
     } catch {
       setMicOk(false); // typed fallback appears
+      stopHandsFree();
     }
+  }
+
+  function clearVad() {
+    if (vadRef.current) cancelAnimationFrame(vadRef.current.raf);
+    vadRef.current = null;
   }
 
   function stopRecording() {
@@ -330,12 +470,68 @@ export default function HomePage() {
     mediaRef.current?.stop();
   }
 
-  async function sendTurn(blob: Blob | null, text: string) {
+  // ---- hands-free: tap once, then listen → send → tutor speaks → listen ----
+  function startHandsFree() {
+    unlockAudio();
+    const Ctx = (window as any).AudioContext || (window as any).webkitAudioContext;
+    if (Ctx && !audioCtxRef.current) audioCtxRef.current = new Ctx();
+    audioCtxRef.current?.resume().catch(() => {});
+    handsFreeRef.current = true;
+    setHandsFree(true);
+    startRecording({ autoStop: true });
+  }
+
+  function stopHandsFree() {
+    setAskKorean(false);
+    handsFreeRef.current = false;
+    setHandsFree(false);
+    clearVad();
+    const r = mediaRef.current;
+    if (r && r.state === "recording") {
+      (r as any)._cancel?.();
+      r.stop();
+    }
+  }
+
+  // Tutor audio finished: in hands-free mode, start listening again.
+  function afterSpeak() {
+    setSpeaking(false);
+    if (handsFreeRef.current) startRecording({ autoStop: true });
+  }
+
+  function say(url: string, text: string) {
+    setSpeaking(true);
+    speak(url, text, afterSpeak);
+  }
+
+  // "한국어로 물어보기" button: record a Korean question (STT asked for Korean).
+  function askInKorean() {
+    unlockAudio();
+    if (handsFreeRef.current) {
+      // stop the current English listen; next take is Korean
+      const r = mediaRef.current;
+      if (r && r.state === "recording") {
+        (r as any)._cancel?.();
+        r.stop();
+      }
+      stopAudio();
+      setSpeaking(false);
+      setTimeout(() => startRecording({ autoStop: true, korean: true }), 150);
+      return;
+    }
+    setAskKorean(true);
+    startRecording({ autoStop: true, korean: true });
+  }
+
+  async function sendTurn(blob: Blob | null, text: string, koreanHelp = false) {
     setProcessing(true);
     try {
       const form = new FormData();
       if (blob) form.append("audio", blob, "turn.webm");
       if (text) form.append("transcript", text);
+      form.append("stt_lang", koreanHelp ? "ko" : "auto");
+      if (koreanHelp) form.append("korean_help", "1");
+      form.append("question", prompt);
       form.append("session_id", sessionId);
       form.append("topic", topic);
       form.append("level", level);
@@ -345,6 +541,16 @@ export default function HomePage() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "turn failed");
       setDemo(Boolean(data.demo));
+      if (!sessionId && data.session_id) setSessionId(data.session_id);
+      if (data.korean_help) {
+        // Not an answer: same question stays; show + speak the suggestion.
+        setAskKorean(false);
+        setTyped("");
+        setHelp({ ko: data.transcript || text, en: data.suggestion_en || "", note: data.note_ko || "", audio: data.suggestion_audio_url || "" });
+        if (data.suggestion_en) say(data.suggestion_audio_url || "", data.suggestion_en);
+        else afterSpeak();
+        return;
+      }
       const turn: Turn = {
         transcript: data.transcript_cleaned || data.transcript,
         corrected: data.corrected,
@@ -367,18 +573,27 @@ export default function HomePage() {
       setShowSamples(false);
       setKoreanHint(null);
       setExtraSample(null);
+      setHelp(null);
       setTyped("");
       setXpFloat({ id: Date.now(), text: "+5 XP" });
-      speak(data.reply_audio_url || "", data.reply_en);
-      if (next.length >= MAX_TURNS) finish(next.length);
+      if (next.length >= MAX_TURNS) {
+        stopHandsFree();
+        speak(data.reply_audio_url || "", data.reply_en);
+        finish(next.length);
+      } else {
+        say(data.reply_audio_url || "", data.reply_en);
+      }
     } catch (e) {
+      stopHandsFree();
       alert(e instanceof Error ? e.message : "오류가 발생했습니다.");
     } finally {
       setProcessing(false);
     }
   }
+  sendTurnRef.current = sendTurn;
 
   async function finish(count: number) {
+    stopHandsFree();
     setPhase("done");
     await fetch("/api/sessions", {
       method: "POST",
@@ -472,17 +687,35 @@ export default function HomePage() {
           <button onClick={submitAuth} className="btn" style={{ width: "100%", marginTop: 8 }}>
             {authMode === "login" ? "로그인" : "가입하기"}
           </button>
+          <div className="faint" style={{ textAlign: "center", margin: "14px 0 8px" }}>또는</div>
+          <button onClick={startDemo} className="btn secondary" style={{ width: "100%" }}>
+            데모로 체험하기
+          </button>
+          <p className="faint" style={{ marginTop: 10, fontSize: 12.5, textAlign: "center" }}>
+            로그인 없이 5분 또는 10마디까지 체험할 수 있어요. 기록은 따로 저장되며 다른 사람과 섞이지 않습니다.
+          </p>
         </section>
       )}
 
       {me && (
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", margin: "-4px 2px 10px" }}>
           <span className="faint">
-            {me.username} 님{me.role === "admin" ? " (관리자)" : ""}
-            {me.role === "admin" && <> · <a href="/admin">학습 현황 보기 →</a></>}
+            {me.is_demo ? (
+              <>데모 체험 중{me.demo ? ` · 대화 ${me.demo.turns_left}회, ${Math.max(0, Math.ceil(me.demo.seconds_left / 60))}분 남음` : ""}</>
+            ) : (
+              <>
+                {me.username} 님{me.role === "admin" ? " (관리자)" : ""}
+                {me.role === "admin" && <> · <a href="/admin">학습 현황 보기 →</a></>}
+              </>
+            )}
           </span>
-          <button onClick={logout} className="btn secondary small">로그아웃</button>
+          <button onClick={logout} className="btn secondary small">{me.is_demo ? "체험 종료" : "로그아웃"}</button>
         </div>
+      )}
+      {me?.is_demo && (
+        <p className="chip amber" style={{ margin: "0 0 10px" }}>
+          데모는 5분 또는 10마디까지 이용할 수 있어요. 가입하면 기록을 남기고 더 연습할 수 있습니다.
+        </p>
       )}
 
       {me && game && (
@@ -523,7 +756,7 @@ export default function HomePage() {
         </div>
       )}
 
-      {me && myCodes.length > 0 && phase !== "live" && (
+      {me && !me.is_demo && myCodes.length > 0 && phase !== "live" && (
         <section className="card" style={{ padding: "14px 18px" }}>
           <div className="faint" style={{ fontWeight: 700, marginBottom: 6 }}>내 초대 코드 — 링크를 보내면 바로 가입할 수 있어요</div>
           {myCodes.slice(0, 3).map((c) => (
@@ -543,6 +776,16 @@ export default function HomePage() {
           <div>
             <div className="num">{dueCount}장</div>
             <div style={{ fontSize: 14, opacity: 0.95 }}>복습할 카드가 기다리고 있어요</div>
+          </div>
+          <span className="arrow">→</span>
+        </a>
+      )}
+
+      {me && phase !== "live" && (
+        <a href="/live" className="big-cta" style={{ background: "var(--blue)" }}>
+          <div>
+            <div className="num" style={{ fontSize: 24 }}>⚡ 실시간 대화</div>
+            <div style={{ fontSize: 14, opacity: 0.95 }}>Grok과 바로 말로 대화 · 끝나면 교정</div>
           </div>
           <span className="arrow">→</span>
         </a>
@@ -597,7 +840,7 @@ export default function HomePage() {
               )}
             </div>
             <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
-              <button onClick={() => speak("", prompt)} className="btn secondary small">
+              <button onClick={() => (handsFree && !recording && !processing ? say("", prompt) : speak("", prompt))} className="btn secondary small">
                 🔊 다시 듣기
               </button>
               {samples.length > 0 && (
@@ -644,6 +887,24 @@ export default function HomePage() {
             )}
           </section>
 
+          {help && (
+            <section className="card" style={{ background: "var(--green-soft)", borderColor: "#a7d7b9" }}>
+              <div className="kicker" style={{ margin: "0 0 6px" }}>이렇게 말해보세요</div>
+              <div className="faint">“{help.ko}”</div>
+              {help.en ? (
+                <div className="en" style={{ fontSize: 24, fontWeight: 700, margin: "8px 0", lineHeight: 1.35, color: "#14532d" }}>{help.en}</div>
+              ) : null}
+              {help.note && <div style={{ fontSize: 14, color: "var(--muted)" }}>{help.note}</div>}
+              <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                {help.en && (
+                  <button className="btn secondary small" onClick={() => (handsFree && !recording && !processing ? say(help.audio, help.en) : speak(help.audio, help.en))}>🔊 다시 듣기</button>
+                )}
+                <button className="btn secondary small" onClick={() => setHelp(null)}>닫기</button>
+              </div>
+              <div className="faint" style={{ marginTop: 6 }}>이제 이 문장(또는 내 말로 바꿔서)을 영어로 말해보세요. 점수는 영어 답변에만 매겨져요.</div>
+            </section>
+          )}
+
           <section className="card">
             {!micOk && (
               <p style={{ color: "var(--red)", fontSize: 13 }}>
@@ -661,10 +922,44 @@ export default function HomePage() {
               <button className={sttMode === "accurate" ? "on" : ""} onClick={() => switchMode("accurate")}>🎯 정확 모드 (녹음)</button>
             </div>
             {micOk && (
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+                {!handsFree ? (
+                  <button onClick={startHandsFree} disabled={processing || recording || listening} className="btn blue" style={{ flex: 1 }}>
+                    🎙️ 자동 대화 시작 (한 번만 탭)
+                  </button>
+                ) : (
+                  <button onClick={() => { stopHandsFree(); stopAudio(); setSpeaking(false); }} className="btn red" style={{ flex: 1 }}>
+                    ⏸ 자동 대화 멈추기
+                  </button>
+                )}
+                <button
+                  onClick={askInKorean}
+                  disabled={processing || (recording && !handsFree) || listening}
+                  className="btn secondary"
+                >
+                  🇰🇷 한국어로 물어보기
+                </button>
+              </div>
+            )}
+            {micOk && handsFree && (
+              <p className="muted" style={{ fontSize: 14, margin: "0 0 6px" }}>
+                {recording
+                  ? "듣고 있어요... 말이 끝나고 잠시 조용하면 자동으로 보내요"
+                  : processing
+                    ? "분석 중..."
+                    : speaking
+                      ? "튜터가 말하는 중... 끝나면 다시 들을게요"
+                      : "잠시만요..."}
+              </p>
+            )}
+            {micOk && !handsFree && recording && askKorean && (
+              <p className="muted" style={{ fontSize: 14, margin: "0 0 6px" }}>한국어로 말해주세요... 멈추면 자동으로 보내요</p>
+            )}
+            {micOk && !handsFree && (
               <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
                 {!listening && !recording && (
                   <button
-                    onClick={sttMode === "accurate" || useRecorder ? startRecording : startListening}
+                    onClick={() => { unlockAudio(); if (sttMode === "accurate" || useRecorder) startRecording(); else startListening(); }}
                     disabled={processing}
                     className="btn blue"
                   >
@@ -698,16 +993,16 @@ export default function HomePage() {
                 🎧 {liveText}
               </div>
             )}
-            {(!micOk || (!listening && !recording)) && !processing && (
+            {(!micOk || (!listening && !recording && !handsFree)) && !processing && (
               <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
                 <input
                   value={typed}
                   onChange={(e) => setTyped(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && typed.trim() && sendTurn(null, typed.trim())}
-                  placeholder="또는 여기에 영어로 입력"
+                  onKeyDown={(e) => e.key === "Enter" && typed.trim() && sendTurn(null, typed.trim(), HANGUL.test(typed))}
+                  placeholder="영어로 입력 (한국어로 쓰면 영어 표현을 알려줘요)"
                   style={{ flex: 1, padding: "12px 14px", borderRadius: 12, border: "1px solid var(--line)", fontSize: 16 }}
                 />
-                <button onClick={() => typed.trim() && sendTurn(null, typed.trim())} className="btn">전송</button>
+                <button onClick={() => typed.trim() && sendTurn(null, typed.trim(), HANGUL.test(typed))} className="btn">전송</button>
               </div>
             )}
           </section>

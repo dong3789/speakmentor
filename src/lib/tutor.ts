@@ -192,15 +192,13 @@ export async function callTutor(input: TutorInput): Promise<TutorResult> {
       "Content-Type": "application/json",
     },
       body: JSON.stringify({
-        model: process.env.TUTOR_MODEL || "gpt-4o-mini",
+        model: process.env.TUTOR_MODEL || "grok-4.20-non-reasoning",
         messages: buildTutorMessages(input),
         response_format: { type: "json_object" },
         temperature: 0.4,
-        // Thinking models (e.g. Gemini 3.x flash) spend part of this budget on
-        // reasoning; too small a cap truncates the JSON mid-object.
         max_tokens: 2000,
-        // Latency: low thinking cuts ~7s -> ~2.5s with no JSON-quality loss.
-        reasoning_effort: process.env.TUTOR_REASONING || "low",
+        // Only sent when set. Grok non-reasoning models reject this field.
+        ...(process.env.TUTOR_REASONING ? { reasoning_effort: process.env.TUTOR_REASONING } : {}),
       }),
   });
   if (!res.ok) {
